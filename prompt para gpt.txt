@@ -1,1 +1,205 @@
 hola te doy un contexto, estoy desarrollando un modelo de LSTM  multivariable multi step con 24, los datos son de una central en ene especifico con frecuencia horaria, tengo como entrada  para la red la generacion_real como variable de interes (Y) y tengo otros pronosticos (externo y coordinado) como variables independientes bajo la logica de combinación de pronostico para lograr uno mejor, otras variablres independientes adicionales son 24 variables dummies que contienen la i nformación respecto a la hora, y las respectivas interacciones entre la externo y las horas y coordinado y las horas (entre la independiente y cada dummy), más una constante que representa el sesgo tengo finalmente un dataset con 73 columnas para y 8616 filas que corresponden a la secuencia de la serie de tiempo del año 2023, respóndeme como un exporto en base a este contexto
+
+
+Quiero que me des y me corrijas el codigo, te lo proporciono en las siguientes imagenes, revisa el tamaño de los shapes de train test y val para la correcta implemntación del modelo de sliding window. El plan es comparar este modelo LSTM con un modelo benchmark de regresión lineal de prediccion con ventana rodante multistep, te compartire a continuación el codigo de implementación del benchmark  para que me des sugerencias y correccion del codigo para hacer los modelos comparables.
+
+central_brutos =df_bruto[df_bruto['Nombre']== central].sort_values(by='Fecha')
+datos_central = df_limpio[df_limpio['Nombre']== central].sort_values(by='Fecha')
+
+
+#Definimas las variables
+Y = datos_central['Generacion_Potencial']
+dummies = pd.get_dummies(datos_central['Hora'], drop_first=True, prefix='h')
+dummies = dummies.astype(float)
+X = pd.concat([datos_central['Externo'],datos_central['Coordinado'], dummies],axis=1)
+X = sm.add_constant(X)
+
+# Definimos las interacciones 
+var_ind = ['Externo', 'Coordinado']
+for var in var_ind:
+    for dummie in dummies.columns:
+        nombre_interaccion = f'{var}-{dummie}'
+        X[nombre_interaccion] = X[var] * X[dummie]
+parametros = {}
+# Definir parámetros específicos de la central
+num_dias_entrenamiento = 60
+filas_por_dia = len(datos_central['Hora'].unique())
+dias_totales = len(X) // filas_por_dia
+potencia_maxima = datos_central['Potencia_max_bruta'].max()
+parametros = {
+    'num_dias_entrenamiento':num_dias_entrenamiento,
+    'filas_por_dia': filas_por_dia,
+        'dias_totales': dias_totales,
+        'potencia_maxima': potencia_maxima
+}
+
+# Inicializar DataFrames temporales para esta central
+predicciones_df1 = pd.DataFrame()
+parametros_df = pd.DataFrame()
+variables_prediccion_df = pd.DataFrame()
+
+# Iterar a través de los días, ajustando el modelo y realizando predicciones
+for dia in range(dias_totales - num_dias_entrenamiento):
+    predicciones_df = pd.DataFrame()
+    # Definir el conjunto de entrenamiento para la ventana actual
+    inicio = dia * filas_por_dia
+    fin = inicio + num_dias_entrenamiento * filas_por_dia
+    X_train = X.iloc[inicio:fin]
+    Y_train = Y.iloc[inicio:fin]
+
+    # Ajustar el modelo
+    modelo = sm.OLS(Y_train, X_train).fit()
+
+    # Extraer y almacenar los parámetros estimados para la fecha actual
+    parametros_actuales = modelo.params
+    parametros_df = pd.concat([parametros_df, pd.DataFrame(parametros_actuales).T])
+
+    # Realizar predicciones para el siguiente día
+    X_test = X.iloc[fin:fin + filas_por_dia] ## X_test tiene un len de 24, se predicen los 24 steps
+    predicciones = modelo.predict(X_test)
+    
+    # Aplicar el límite inferior y superior a las predicciones
+    predicciones = np.maximum(predicciones, 0)  # Límite inferior, asegurando que la predicción no sea menor que 0
+    predicciones = np.minimum(predicciones, potencia_maxima)  # Límite superior
+    
+    predicciones_df['pred'] = predicciones
+    predicciones_df['Fecha'] = datos_central['Fecha'].iloc[fin:fin + filas_por_dia]
+    # Almacenar las predicciones
+    predicciones_df1 = pd.concat([predicciones_df1, predicciones_df])
+    # Almacenar las variables utilizadas para la predicción del nuevo día
+    variables_prediccion_df = pd.concat([variables_prediccion_df, X_test])
+
+# Almacenar los resultados en el diccionario, usando el nombre de la central como clave
+predicciones_df1.rename(columns={0:'pred'},inplace=True)
+
+
+A continuacion te comparto el codigo que utiliza el benchmark de regresion lineal para calcular los errores: 
+ datos_central = consolidado[central]['datos_central']
+    parametros_dict = consolidado[central]['parametros']
+    parametros = pd.DataFrame([parametros_dict])  # Convertir el diccionario a DataFrame
+    parametros['central'] = central  # Asegurar que 'central' se añade como columna al DataFrame
+    predicciones = consolidado[central]['predicciones']
+    predicciones.reset_index(inplace=True, drop=True)
+    potencia_maxima = parametros['potencia_maxima'].iloc[0]  # Asegurar acceso al valor correcto
+    dc245  = pd.DataFrame()
+    dc245 = datos_central.iloc[(int(parametros_dict['num_dias_entrenamiento']))*int(parametros_dict['filas_por_dia']):].copy()
+    dc245.reset_index(inplace=True, drop=True)
+    dc245['Fecha'] = pd.to_datetime(dc245['Fecha'])
+     # Asegurar que solo se incluyan datos de junio a diciembre
+    #dc245 = dc245[dc245['Fecha'].dt.month >= 5]
+    dc245['f_pred'] = predicciones['Fecha']
+    dc245['pred'] = predicciones['pred']
+    
+    dc245['dia'] = dc245['Fecha'].dt.date
+    dc245['identificador'] = pd.factorize(dc245['dia'])[0]
+
+    error = pd.DataFrame()
+    error['central'] = dc245['Nombre']
+    error['Fecha'] = dc245['Fecha']
+    error.reset_index(inplace=True, drop='index')
+
+    #Regresión
+    error['error_regresion'] = dc245['Generacion_Potencial']- dc245['pred']# Calcular el MAE y RMSE
+    error['MAE_regresion'] = np.abs(error['error_regresion'])
+    error['RMSE_regresion'] = error['error_regresion'] ** 2
+
+    #Externo
+    error['err_externo'] = dc245['Generacion_Potencial']- dc245['Externo']
+    error['MAE_externo'] = np.abs(error['err_externo'])
+    error['RMSE_externo'] = error['err_externo'] ** 2
+
+    #Coordinado
+    error['err_Coordinado'] = dc245['Generacion_Potencial']- dc245['Coordinado']
+    error['MAE_coordinado'] = np.abs(error['err_Coordinado'])
+    error['RMSE_coordinado'] = error['err_Coordinado'] ** 2
+
+    #SExperto
+    error['err_SExperto'] = dc245['Generacion_Potencial']- dc245['SExperto']
+    error['MAE_SExperto'] = np.abs(error['err_SExperto'])
+    error['RMSE_SExperto'] = error['err_SExperto'] ** 2
+    
+    #Centralizado
+    error['err_Centralizado'] = dc245['Generacion_Potencial']- dc245['Centralizado']
+    error['MAE_Centralizado'] = np.abs(error['err_Centralizado'])
+    error['RMSE_Centralizado'] = error['err_Centralizado'] ** 2
+    
+    
+    ################# TOTALv############################
+    # Calcular el MAE y RMSE totales para el período completo para cada tipo de error
+    error_total = pd.DataFrame(index=['Total'])
+
+    error_total['MAE_regresion'] = error['MAE_regresion'].mean() / potencia_maxima
+    error_total['RMSE_regresion'] = np.sqrt(error['RMSE_regresion'].mean()) / potencia_maxima
+
+    error_total['MAE_externo'] = error['MAE_externo'].mean() / potencia_maxima
+    error_total['RMSE_externo'] = np.sqrt(error['RMSE_externo'].mean()) / potencia_maxima
+
+    error_total['MAE_coordinado'] = error['MAE_coordinado'].mean() / potencia_maxima
+    error_total['RMSE_coordinado'] = np.sqrt(error['RMSE_coordinado'].mean()) / potencia_maxima
+
+    error_total['MAE_SExperto'] = error['MAE_SExperto'].mean() / potencia_maxima
+    error_total['RMSE_SExperto'] = np.sqrt(error['RMSE_SExperto'].mean()) / potencia_maxima
+    
+    error_total['MAE_Centralizado'] = error['MAE_Centralizado'].mean() / potencia_maxima
+    error_total['RMSE_Centralizado'] = np.sqrt(error['RMSE_Centralizado'].mean()) / potencia_maxima
+    
+    
+
+     # Corrección aquí: Selecciona el primer elemento de la Serie con [0] para obtener un valor escalar
+    rmse_centrales.loc[central, 'Regresión'] = error_total['RMSE_regresion'].iloc[0]
+    rmse_centrales.loc[central, 'Externo'] = error_total['RMSE_externo'].iloc[0]
+    rmse_centrales.loc[central, 'Coordinado'] = error_total['RMSE_coordinado'].iloc[0]
+    rmse_centrales.loc[central, 'SExperto'] = error_total['RMSE_SExperto'].iloc[0]
+    rmse_centrales.loc[central, 'Centralizado'] = error_total['RMSE_Centralizado'].iloc[0]
+    #rmse_centrales /= potencia_maxima
+    
+    ################ MENSUAL##################
+    error_mensual = pd.DataFrame()
+    
+   
+    error_mensual['MAPE_regresion'] = (error.resample('ME', on='Fecha')['MAE_regresion'].mean() / potencia_maxima)*100
+    error_mensual['RMSE_regresion'] = (error.resample('ME', on='Fecha')['RMSE_regresion'].apply(lambda x: np.sqrt(x.mean())) / potencia_maxima)*100
+    error_mensual['central'] = central
+    
+    error_mensual['MAPE_externo'] = (error.resample('ME', on='Fecha')['MAE_externo'].mean() / potencia_maxima)*100
+    error_mensual['RMSE_externo'] = (error.resample('ME', on='Fecha')['RMSE_externo'].apply(lambda x: np.sqrt(x.mean())) / potencia_maxima)*100
+
+    error_mensual['MAPE_coordinado'] = (error.resample('ME', on='Fecha')['MAE_coordinado'].mean() / potencia_maxima)*100
+    error_mensual['RMSE_coordinado'] = (error.resample('ME', on='Fecha')['RMSE_coordinado'].apply(lambda x: np.sqrt(x.mean())) / potencia_maxima)*100
+
+    error_mensual['MAPE_SExperto'] = (error.resample('ME', on='Fecha')['MAE_SExperto'].mean() / potencia_maxima)*100
+    error_mensual['RMSE_SExperto'] = (error.resample('ME', on='Fecha')['RMSE_SExperto'].apply(lambda x: np.sqrt(x.mean())) / potencia_maxima)*100
+    
+    error_mensual['MAPE_Centralizado'] = (error.resample('ME', on='Fecha')['MAE_Centralizado'].mean() / potencia_maxima)*100
+    error_mensual['RMSE_Centralizado'] = (error.resample('ME', on='Fecha')['RMSE_Centralizado'].apply(lambda x: np.sqrt(x.mean())) / potencia_maxima)*100
+    error_mensual.reset_index(inplace=True)
+    
+    ########################## Diario ######################################################
+    
+    error_diario = pd.DataFrame()
+    error_diario['MAE_regresion'] = (error.groupby(error['Fecha'].dt.date)['MAE_regresion'].mean() /potencia_maxima) *100
+    error_diario['RMSE_regresion'] = (np.sqrt(error.groupby(error['Fecha'].dt.date)['RMSE_regresion'].mean() /potencia_maxima)) *100
+    error_diario['central'] = central
+
+    error_diario['MAE_externo'] = (error.groupby(error['Fecha'].dt.date)['MAE_externo'].mean() /potencia_maxima) *100
+    error_diario['RMSE_externo'] = (np.sqrt(error.groupby(error['Fecha'].dt.date)['RMSE_externo'].mean() /potencia_maxima))*100
+
+
+    error_diario['MAE_coordinado'] = (error.groupby(error['Fecha'].dt.date)['MAE_coordinado'].mean() /potencia_maxima) *100
+    error_diario['RMSE_coordinado'] = (np.sqrt(error.groupby(error['Fecha'].dt.date)['RMSE_coordinado'].mean() /potencia_maxima))*100
+
+
+    error_diario['MAE_SExperto'] = (error.groupby(error['Fecha'].dt.date)['MAE_SExperto'].mean() /potencia_maxima) *100
+    error_diario['RMSE_SExperto'] = (np.sqrt(error.groupby(error['Fecha'].dt.date)['RMSE_SExperto'].mean() /potencia_maxima))*100
+
+    error_diario['MAE_Centralizado'] = (error.groupby(error['Fecha'].dt.date)['MAE_Centralizado'].mean() /potencia_maxima) *100
+    error_diario['RMSE_Centralizado'] = (np.sqrt(error.groupby(error['Fecha'].dt.date)['RMSE_Centralizado'].mean() /potencia_maxima))*100
+    error_diario.reset_index(inplace=True)
+    
+ 
+    
+    dferror = pd.concat([dferror,error])
+    df245 = pd.concat([df245, dc245], ignore_index=True)  
+    parametrosC = pd.concat([parametrosC, parametros], ignore_index=True) 
+    rmse_mensuales = pd.concat([rmse_mensuales,error_mensual],ignore_index=True)
+    rmse_diario = pd.concat([rmse_diario,error_diario],ignore_index=True)
